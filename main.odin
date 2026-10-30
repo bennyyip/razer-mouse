@@ -4,11 +4,15 @@ import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import win32 "core:sys/windows"
 import "core:time"
 
+println :: fmt.println
 
+// mouse vid and pid can be found here:
+// https://github.com/openrazer/openrazer#mice
 Mouse :: struct {
 	vid: u16,
 	pid: u16,
@@ -16,11 +20,9 @@ Mouse :: struct {
 
 Razer_DeathAdder_V2_X_HyperSpeed: Mouse = {0x1532, 0x9c}
 
-
 Device :: struct {
 	handle: win32.HANDLE,
 }
-
 
 Razer_Status :: enum u8 {
 	NEW_COMMAND                    = 0,
@@ -362,14 +364,28 @@ get_dpi :: proc(dev: ^Device) -> (_dpi: [2]u16be, _ok: bool) {
 	return {0, 0}, false
 }
 
-set_dpi :: proc(dpi: int) {
-	report: Razer_Report = {
-		command_class = 0x04,
-		command_id    = 0x05,
-		data_size     = 0x07,
+// set_dpi :: proc(dpi: int) {
+// 	report: Razer_Report = {
+// 		command_class = 0x04,
+// 		command_id    = 0x05,
+// 		data_size     = 0x07,
+// 	}
+// }
+
+get_battery :: proc(dev: ^Device) -> (_battery: int, _ok: bool) {
+	req: Razer_Report = {
+		command_class = 0x07,
+		command_id    = 0x80,
+		data_size     = 0x02,
+	}
+	rsp, ok := send_feature_report(dev, &req)
+	if ok {
+		battery := int(f32(rsp.arguments[1]) / 255 * 100)
+		return battery, true
+	} else {
+		return -1, false
 	}
 }
-
 
 print_dpi :: proc(dev: ^Device) {
 	dpi, ok := get_dpi(dev)
@@ -383,7 +399,7 @@ print_dpi :: proc(dev: ^Device) {
 print_dpi_stages :: proc(dev: ^Device) {
 	active_stage, stages, ok := get_dpi_stages(dev)
 	if ok {
-		fmt.printfln("active_stage: %d", active_stage)
+		fmt.println("active_stage:", active_stage)
 		fmt.println("stages:")
 		for stage, i in stages {
 			fmt.println(i + 1, stage)
@@ -391,6 +407,21 @@ print_dpi_stages :: proc(dev: ^Device) {
 	} else {
 		fmt.eprintln("Failed to get DPI stages")
 	}
+}
+
+print_battery :: proc(dev: ^Device) {
+	battery, ok := get_battery(dev)
+	if ok {
+		fmt.println("battery:", battery)
+	} else {
+		fmt.eprintln("Failed to get battery")
+	}
+}
+
+print_status :: proc(dev: ^Device) {
+	print_dpi(dev)
+	print_battery(dev)
+	print_dpi_stages(dev)
 }
 
 main :: proc() {
@@ -401,17 +432,36 @@ main :: proc() {
 	}
 	defer device_close(&dev)
 
-	// stages: [][2]u16 = {
-	// 	{800, 800},
-	// 	{1600, 1600},
-	// 	{3200, 3200},
-	// 	{4800, 4800},
-	// 	{6400, 6400},
-	// }
-
-	stages: [][2]u16 = {{4800, 4800}}
-
-	set_dpi_stages(&dev, stages, 1)
-	print_dpi_stages(&dev)
-	print_dpi(&dev)
+	argc := len(os.args)
+	if argc >= 2 {
+		cmd := os.args[1]
+		switch cmd {
+		case "status":
+			print_status(&dev)
+		case "setdpi":
+			if argc < 3 {
+				fmt.eprintln("Not enough args, dpi is not provided")
+			} else {
+				dpi, ok := strconv.parse_uint(os.args[2])
+				assert(ok && dpi <= auto_cast max(u16))
+				stages: [][2]u16 = {{u16(dpi), u16(dpi)}}
+				set_dpi_stages(&dev, stages, 1)
+			}
+		case "reset":
+			stages: [][2]u16 = {
+				{800, 800},
+				{1600, 1600},
+				{3200, 3200},
+				{4800, 4800},
+				{6400, 6400},
+			}
+			set_dpi_stages(&dev, stages, 1)
+		case "help":
+			fmt.eprintln("Avaliable commands: status, setdpi, reset, help")
+		case:
+			fmt.eprintln("Unknown command:", cmd)
+		}
+	} else {
+		print_status(&dev)
+	}
 }
