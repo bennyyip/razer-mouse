@@ -1,6 +1,4 @@
 package main
-import "base:runtime"
-import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -8,8 +6,6 @@ import "core:strconv"
 import "core:strings"
 import win32 "core:sys/windows"
 import "core:time"
-
-println :: fmt.println
 
 // mouse vid and pid can be found here:
 // https://github.com/openrazer/openrazer#mice
@@ -60,43 +56,47 @@ Razer_Report :: struct {
 }
 REPORT_SIZE :: size_of(Razer_Report)
 HIDBUF_SIZE :: REPORT_SIZE + 1
-
 #assert(REPORT_SIZE == 90)
+
 NOTSTORE :: 0
 VARSTORE :: 1
 
 RAZER_MOUSE_MAX_DPI_STAGES :: 5
 
-find_mouse_device :: proc(mouse: Mouse) -> (dev: Device, ok: bool) {
+find_mouse_device :: proc(mouse: Mouse) -> (_dev: Device, _ok: bool) {
 	guid: win32.GUID
 	win32.HidD_GetHidGuid(&guid)
-	set := SetupDiGetClassDevsW(
+	set := win32.SetupDiGetClassDevsW(
 		&guid,
 		nil,
 		nil,
-		DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+		win32.DIGCF_PRESENT | win32.DIGCF_DEVICEINTERFACE,
 	)
 	if (win32.HANDLE(set) == win32.INVALID_HANDLE) {
-		ok = false
-		return
+		return {}, false
 	}
-	defer SetupDiDestroyDeviceInfoList(set)
+	defer win32.SetupDiDestroyDeviceInfoList(set)
 
-	paths := make([dynamic]cstring, context.temp_allocator)
 	neddle := fmt.tprintf("vid_%04x&pid_%04x", mouse.vid, mouse.pid)
 
 	device_idx: u32 = 0
 	for {
-		iface: SP_DEVICE_INTERFACE_DATA = {
-			cbSize = size_of(SP_DEVICE_INTERFACE_DATA),
+		iface: win32.SP_DEVICE_INTERFACE_DATA = {
+			cbSize = size_of(win32.SP_DEVICE_INTERFACE_DATA),
 		}
-		res := SetupDiEnumDeviceInterfaces(set, nil, &guid, device_idx, &iface)
+		res := win32.SetupDiEnumDeviceInterfaces(
+			set,
+			nil,
+			&guid,
+			device_idx,
+			&iface,
+		)
 		if !res {
 			break
 		}
 
 		required_size: win32.DWORD
-		res = SetupDiGetDeviceInterfaceDetailW(
+		res = win32.SetupDiGetDeviceInterfaceDetailW(
 			set,
 			&iface,
 			nil,
@@ -109,12 +109,14 @@ find_mouse_device :: proc(mouse: Mouse) -> (dev: Device, ok: bool) {
 			required_size,
 			context.temp_allocator,
 		)
-		iface_detailed := PSP_DEVICE_INTERFACE_DETAIL_DATA_W(
-			raw_data(iface_detailed_buf[:]),
+		iface_detailed := win32.PSP_DEVICE_INTERFACE_DETAIL_DATA_W(
+			&iface_detailed_buf[0],
 		)
-		iface_detailed.cbSize = size_of(SP_DEVICE_INTERFACE_DETAIL_DATA_W)
+		iface_detailed.cbSize = size_of(
+			win32.SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+		)
 
-		res = SetupDiGetDeviceInterfaceDetailW(
+		res = win32.SetupDiGetDeviceInterfaceDetailW(
 			set,
 			&iface,
 			iface_detailed,
@@ -127,15 +129,13 @@ find_mouse_device :: proc(mouse: Mouse) -> (dev: Device, ok: bool) {
 			continue
 		}
 
-		path, err := win32.wstring_to_utf8(
-			cstring16(transmute(^u16)raw_data(iface_detailed.DevicePath[:])),
-		)
+		wpath := win32.wstring(&iface_detailed.DevicePath[0])
+		path, err := win32.wstring_to_utf8(wpath)
 		if (err != nil) {
 			return {}, false
 		}
 		if strings.contains(path, neddle) {
-
-			dev, ok := device_open_path(path)
+			dev, ok := device_open_path(wpath)
 			if !ok {
 				continue
 			}
@@ -163,17 +163,16 @@ find_mouse_device :: proc(mouse: Mouse) -> (dev: Device, ok: bool) {
 
 @(require_results)
 device_open_path :: proc(
-	path: string,
+	path: win32.wstring,
 	open_rw: bool = false,
 ) -> (
 	dev: Device,
 	ok: bool,
 ) {
-	wpath := win32.utf8_to_wstring(path)
 	desired_access :=
 		(open_rw) ? (win32.GENERIC_WRITE | win32.GENERIC_READ) : 0
 	handle := win32.CreateFileW(
-		wpath,
+		path,
 		desired_access,
 		win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE,
 		nil,
@@ -215,13 +214,9 @@ send_feature_report :: proc(
 	razer_report_set_crc(req)
 	// println("REQUEST:", req)
 
-	runtime.mem_copy_non_overlapping(
-		raw_data(req_buf[1:]),
-		rawptr(req),
-		REPORT_SIZE,
-	)
+	mem.copy_non_overlapping(&req_buf[1], req, REPORT_SIZE)
 
-	res := win32.HidD_SetFeature(dev.handle, raw_data(req_buf[:]), HIDBUF_SIZE)
+	res := win32.HidD_SetFeature(dev.handle, &req_buf[0], HIDBUF_SIZE)
 	if (!res) {
 		return rsp, false
 	}
@@ -230,13 +225,9 @@ send_feature_report :: proc(
 	time.accurate_sleep(wait_time)
 
 	for _retry := 5; _retry > 0; _retry -= 1 {
-		res := win32.HidD_GetFeature(
-			dev.handle,
-			raw_data(rsp_buf[:]),
-			HIDBUF_SIZE,
-		)
+		res = win32.HidD_GetFeature(dev.handle, &rsp_buf[0], HIDBUF_SIZE)
 		if res {
-			rsp := transmute(^Razer_Report)(raw_data(rsp_buf[1:]))
+			rsp := cast(^Razer_Report)(&rsp_buf[1])
 			if rsp.status == .COMMAND_SUCCESSFUL &&
 			   rsp.transaction_id == req.transaction_id &&
 			   rsp.command_id == req.command_id &&
@@ -292,7 +283,7 @@ set_dpi_stages :: proc(
 		offset += 7
 	}
 
-	rsp, ok := send_feature_report(dev, &req)
+	_, ok := send_feature_report(dev, &req)
 	return ok
 }
 
@@ -311,6 +302,11 @@ get_dpi_stages :: proc(
 	}
 	req.arguments[0] = VARSTORE
 	rsp, ok := send_feature_report(dev, &req)
+
+	if !ok {
+		_ok = false
+		return
+	}
 
 	// Response format (hex):
 	// 01    varstore
@@ -442,7 +438,8 @@ main :: proc() {
 			if argc < 3 {
 				fmt.eprintln("Not enough args, dpi is not provided")
 			} else {
-				dpi, ok := strconv.parse_uint(os.args[2])
+				dpi: uint
+				dpi, ok = strconv.parse_uint(os.args[2])
 				assert(ok && dpi <= auto_cast max(u16))
 				stages: [][2]u16 = {{u16(dpi), u16(dpi)}}
 				set_dpi_stages(&dev, stages, 1)
